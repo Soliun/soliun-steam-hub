@@ -6,6 +6,7 @@ import re
 import random
 import threading
 import webbrowser
+from collections import defaultdict
 
 CONFIG_FILE = "config.json"
 CACHE_FILE = "library_cache.json"
@@ -28,8 +29,8 @@ def save_json(path, data):
 
 
 def scan_local_steam_games():
-    """Varre as pastas da Steam nos discos locais para identificar jogos instalados e tamanho."""
-    installed = {}
+    """Varre as pastas da Steam nos discos locais para identificar jogos instalados, tamanho e unidade."""
+    installed = {}  # {appid: {"size": int, "drive": str}}
     candidate_roots = [
         r"C:\Program Files (x86)\Steam",
         r"C:\Program Files\Steam",
@@ -57,6 +58,7 @@ def scan_local_steam_games():
                 pass
 
     for folder in library_folders:
+        drive_letter = os.path.splitdrive(folder)[0].upper() or "PC"
         try:
             for fname in os.listdir(folder):
                 if fname.startswith("appmanifest_") and fname.endswith(".acf"):
@@ -68,7 +70,7 @@ def scan_local_steam_games():
                     if appid_m:
                         appid = int(appid_m.group(1))
                         size_bytes = int(size_m.group(1)) if size_m else 0
-                        installed[appid] = size_bytes
+                        installed[appid] = {"size": size_bytes, "drive": drive_letter}
         except Exception:
             pass
 
@@ -85,11 +87,11 @@ def format_size_gb(size_bytes):
 
 
 def main(page: ft.Page):
-    page.title = "Soliun Steam Hub"
+    page.title = "Soliun Steam Hub v0.3.0"
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = "#0E1117"
-    page.window.width = 1220
-    page.window.height = 800
+    page.window.width = 1240
+    page.window.height = 820
     page.padding = 20
 
     config = load_json(CONFIG_FILE, {"api_key": "", "steam_id": ""})
@@ -99,6 +101,7 @@ def main(page: ft.Page):
 
     current_filter = "all"
     search_query = ""
+    current_view = "library"  # "library" | "stats"
 
     # Controles de UI globais
     status_text = ft.Text("", size=13, color="#9BA3B0")
@@ -126,6 +129,13 @@ def main(page: ft.Page):
         child_aspect_ratio=0.73,
         spacing=14,
         run_spacing=14,
+    )
+
+    stats_view = ft.Column(
+        expand=True,
+        scroll=ft.ScrollMode.AUTO,
+        spacing=16,
+        visible=False,
     )
 
     def show_toast(message):
@@ -178,7 +188,7 @@ def main(page: ft.Page):
         unplayed_g = sum(1 for g in games if g.get("playtime_forever", 0) == 0)
 
         installed_count = sum(1 for g in games if g["appid"] in installed_map)
-        installed_bytes = sum(installed_map.get(g["appid"], 0) for g in games if g["appid"] in installed_map)
+        installed_bytes = sum(installed_map[g["appid"]]["size"] for g in games if g["appid"] in installed_map)
 
         stat_total_games.value = str(total_g)
         stat_total_hours.value = f"{int(total_m // 60):,}h".replace(",", ".")
@@ -194,8 +204,281 @@ def main(page: ft.Page):
         save_json(BACKLOG_FILE, backlog)
         if current_filter in ["queue", "playing", "completed", "dropped"]:
             render_games()
+        elif current_view == "stats":
+            render_stats()
+            page.update()
         else:
             page.update()
+
+    def render_stats():
+        games = cache.get("games", [])
+        total_g = len(games)
+        if total_g == 0:
+            stats_view.controls = [
+                ft.Text("Sincronize sua biblioteca para visualizar as estatísticas.", color="#9BA3B0")
+            ]
+            return
+
+        played_games = [g for g in games if g.get("playtime_forever", 0) > 0]
+        unplayed_count = total_g - len(played_games)
+        total_mins = sum(g.get("playtime_forever", 0) for g in games)
+        total_hours = total_mins / 60
+        avg_hours_played = (total_hours / len(played_games)) if played_games else 0
+        engagement_pct = (len(played_games) / total_g) * 100
+
+        sorted_by_time = sorted(games, key=lambda x: x.get("playtime_forever", 0), reverse=True)
+        top_10 = [g for g in sorted_by_time[:10] if g.get("playtime_forever", 0) > 0]
+        max_mins = top_10[0]["playtime_forever"] if top_10 else 1
+        top_game_name = top_10[0].get("name", "-") if top_10 else "Nenhum"
+        top_game_hours = f"{top_10[0]['playtime_forever'] / 60:.1f}h" if top_10 else "0h"
+
+        # 1. Cards de KPIs Analíticos
+        def kpi_box(icon, label, value, sub, color):
+            return ft.Container(
+                expand=True,
+                bgcolor="#161B22",
+                border=ft.Border.all(1, "#262C36"),
+                border_radius=10,
+                padding=14,
+                content=ft.Column(
+                    spacing=4,
+                    controls=[
+                        ft.Row(
+                            spacing=6,
+                            controls=[
+                                ft.Icon(icon, size=16, color=color),
+                                ft.Text(label, size=12, color="#9BA3B0"),
+                            ],
+                        ),
+                        ft.Text(value, size=20, weight=ft.FontWeight.BOLD, color=color, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(sub, size=11, color="#6B7280"),
+                    ],
+                ),
+            )
+
+        kpi_row = ft.Row(
+            spacing=12,
+            controls=[
+                kpi_box(
+                    ft.Icons.PIE_CHART,
+                    "Taxa de Aproveitamento",
+                    f"{engagement_pct:.1f}%",
+                    f"{len(played_games)} jogados vs. {unplayed_count} intactos",
+                    "#38BDF8",
+                ),
+                kpi_box(
+                    ft.Icons.AV_TIMER,
+                    "Média por Jogo Aberto",
+                    f"{avg_hours_played:.1f} h",
+                    f"Total acumulado: {int(total_hours):,}h".replace(",", "."),
+                    "#4ADE80",
+                ),
+                kpi_box(
+                    ft.Icons.EMOJI_EVENTS,
+                    "Rei da Biblioteca",
+                    top_game_name,
+                    f"{top_game_hours} registradas na Steam",
+                    "#FACC15",
+                ),
+                kpi_box(
+                    ft.Icons.BOOKMARK_ADDED,
+                    "Backlog Catalogado",
+                    f"{len(backlog)} jogos",
+                    f"{sum(1 for v in backlog.values() if v == 'completed')} zerados marcados",
+                    "#C084FC",
+                ),
+            ],
+        )
+
+        # 2. Gráfico de Barras: Top 10 Mais Jogados
+        top_bars = []
+        for idx, g in enumerate(top_10, start=1):
+            mins = g.get("playtime_forever", 0)
+            hrs = mins / 60
+            ratio = mins / max_mins
+            bar_color = "#4ADE80" if idx == 1 else ("#38BDF8" if idx <= 3 else "#60A5FA")
+
+            top_bars.append(
+                ft.Column(
+                    spacing=4,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(
+                                    f"#{idx}  {g.get('name', '')}",
+                                    size=12,
+                                    weight=ft.FontWeight.W_600,
+                                    max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                ),
+                                ft.Text(f"{hrs:.1f} h", size=12, color=bar_color, weight=ft.FontWeight.BOLD),
+                            ],
+                        ),
+                        ft.ProgressBar(
+                            value=ratio,
+                            color=bar_color,
+                            bgcolor="#1F2937",
+                            height=8,
+                            border_radius=4,
+                        ),
+                    ],
+                )
+            )
+
+        top_10_panel = ft.Container(
+            expand=3,
+            bgcolor="#161B22",
+            border=ft.Border.all(1, "#262C36"),
+            border_radius=10,
+            padding=16,
+            content=ft.Column(
+                spacing=12,
+                controls=[
+                    ft.Row(
+                        spacing=8,
+                        controls=[
+                            ft.Icon(ft.Icons.BAR_CHART, color="#4ADE80", size=18),
+                            ft.Text("Top 10 Jogos Mais Jogados", size=15, weight=ft.FontWeight.BOLD),
+                        ],
+                    ),
+                    ft.Divider(height=1, color="#262C36"),
+                    *(top_bars if top_bars else [ft.Text("Nenhum jogo com tempo registrado.", color="#9BA3B0")]),
+                ],
+            ),
+        )
+
+        # 3. Painel Lateral: Distribuição do Backlog + Uso por Unidade (SSD)
+        status_meta = [
+            ("completed", "Zerados", "#4ADE80"),
+            ("playing", "Jogando", "#FACC15"),
+            ("queue", "Na Fila", "#38BDF8"),
+            ("dropped", "Abandonados", "#F87171"),
+            ("none", "Sem status", "#6B7280"),
+        ]
+        counts = defaultdict(int)
+        for g in games:
+            st = backlog.get(str(g["appid"]), "none")
+            counts[st] += 1
+
+        backlog_bars = []
+        for st_key, label, color in status_meta:
+            c = counts[st_key]
+            pct = (c / total_g) if total_g else 0
+            backlog_bars.append(
+                ft.Column(
+                    spacing=4,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(label, size=12, color="#E5E7EB"),
+                                ft.Text(f"{c} ({pct * 100:.0f}%)", size=12, color=color, weight=ft.FontWeight.BOLD),
+                            ],
+                        ),
+                        ft.ProgressBar(
+                            value=pct,
+                            color=color,
+                            bgcolor="#1F2937",
+                            height=7,
+                            border_radius=4,
+                        ),
+                    ],
+                )
+            )
+
+        # Armazenamento por Unidade (C:, D:, etc.)
+        drive_sizes = defaultdict(int)
+        drive_counts = defaultdict(int)
+        for g in games:
+            info = installed_map.get(g["appid"])
+            if info:
+                drive_sizes[info["drive"]] += info["size"]
+                drive_counts[info["drive"]] += 1
+
+        total_disk_bytes = sum(drive_sizes.values()) or 1
+        drive_rows = []
+        for drv in sorted(drive_sizes.keys()):
+            sz = drive_sizes[drv]
+            cnt = drive_counts[drv]
+            ratio = sz / total_disk_bytes
+            drive_rows.append(
+                ft.Column(
+                    spacing=4,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(f"Unidade {drv}\\ ({cnt} jogos)", size=12, color="#E5E7EB"),
+                                ft.Text(format_size_gb(sz), size=12, color="#C084FC", weight=ft.FontWeight.BOLD),
+                            ],
+                        ),
+                        ft.ProgressBar(
+                            value=ratio,
+                            color="#C084FC",
+                            bgcolor="#1F2937",
+                            height=7,
+                            border_radius=4,
+                        ),
+                    ],
+                )
+            )
+
+        right_column = ft.Column(
+            expand=2,
+            spacing=14,
+            controls=[
+                ft.Container(
+                    bgcolor="#161B22",
+                    border=ft.Border.all(1, "#262C36"),
+                    border_radius=10,
+                    padding=16,
+                    content=ft.Column(
+                        spacing=10,
+                        controls=[
+                            ft.Row(
+                                spacing=8,
+                                controls=[
+                                    ft.Icon(ft.Icons.LABEL, color="#38BDF8", size=18),
+                                    ft.Text("Distribuição do Backlog", size=15, weight=ft.FontWeight.BOLD),
+                                ],
+                            ),
+                            ft.Divider(height=1, color="#262C36"),
+                            *backlog_bars,
+                        ],
+                    ),
+                ),
+                ft.Container(
+                    bgcolor="#161B22",
+                    border=ft.Border.all(1, "#262C36"),
+                    border_radius=10,
+                    padding=16,
+                    content=ft.Column(
+                        spacing=10,
+                        controls=[
+                            ft.Row(
+                                spacing=8,
+                                controls=[
+                                    ft.Icon(ft.Icons.STORAGE, color="#C084FC", size=18),
+                                    ft.Text("Espaço Steam por Disco", size=15, weight=ft.FontWeight.BOLD),
+                                ],
+                            ),
+                            ft.Divider(height=1, color="#262C36"),
+                            *(drive_rows if drive_rows else [ft.Text("Nenhum jogo local detectado.", size=12, color="#9BA3B0")]),
+                        ],
+                    ),
+                ),
+            ],
+        )
+
+        stats_view.controls = [
+            kpi_row,
+            ft.Row(
+                vertical_alignment=ft.CrossAxisAlignment.START,
+                spacing=14,
+                controls=[top_10_panel, right_column],
+            ),
+        ]
 
     def render_games():
         games = cache.get("games", [])
@@ -224,7 +507,7 @@ def main(page: ft.Page):
         if current_filter == "most_played":
             filtered.sort(key=lambda x: x.get("playtime_forever", 0), reverse=True)
         elif current_filter == "installed":
-            filtered.sort(key=lambda x: installed_map.get(x["appid"], 0), reverse=True)
+            filtered.sort(key=lambda x: installed_map.get(x["appid"], {}).get("size", 0), reverse=True)
         else:
             filtered.sort(key=lambda x: x.get("name", "").lower())
 
@@ -273,7 +556,7 @@ def main(page: ft.Page):
                                 controls=[
                                     ft.Icon(ft.Icons.STORAGE, size=11, color="#C084FC"),
                                     ft.Text(
-                                        format_size_gb(installed_map.get(appid, 0)),
+                                        format_size_gb(installed_map[appid]["size"]) if is_inst else "",
                                         size=10,
                                         color="#E9D5FF",
                                         weight=ft.FontWeight.BOLD,
@@ -345,6 +628,27 @@ def main(page: ft.Page):
         status_text.value = f"Exibindo {len(filtered)} de {len(games)} jogos"
         page.update()
 
+    def switch_view(target_view):
+        nonlocal current_view
+        current_view = target_view
+        is_lib = target_view == "library"
+
+        games_grid.visible = is_lib
+        stats_view.visible = not is_lib
+        search_field.visible = is_lib
+        filter_dropdown.visible = is_lib
+
+        btn_lib_view.style = ft.ButtonStyle(bgcolor="#2563EB" if is_lib else "#161B22")
+        btn_stats_view.style = ft.ButtonStyle(bgcolor="#2563EB" if not is_lib else "#161B22")
+
+        if not is_lib:
+            render_stats()
+            status_text.value = "Painel analítico da biblioteca"
+        else:
+            render_games()
+            return
+        page.update()
+
     def open_roulette_dialog(e=None):
         games = cache.get("games", [])
         if not games:
@@ -406,7 +710,9 @@ def main(page: ft.Page):
                         controls=[
                             ft.Text(f"Tempo: {format_hours(mins)}", size=12, color="#4ADE80"),
                             ft.Text(
-                                f"SSD: {format_size_gb(installed_map[appid])}" if is_inst else "Não instalado no PC",
+                                f"SSD {installed_map[appid]['drive']}\\: {format_size_gb(installed_map[appid]['size'])}"
+                                if is_inst
+                                else "Não instalado no PC",
                                 size=12,
                                 color="#C084FC" if is_inst else "#9BA3B0",
                             ),
@@ -464,7 +770,10 @@ def main(page: ft.Page):
                     cache["games"] = games
                     save_json(CACHE_FILE, cache)
                     update_stats_and_profile()
-                    render_games()
+                    if current_view == "stats":
+                        render_stats()
+                    else:
+                        render_games()
                     status_text.value = f"Sincronizado! {len(games)} jogos ({len(installed_map)} instalados)."
 
             except Exception as ex:
@@ -571,37 +880,57 @@ def main(page: ft.Page):
         ],
     )
 
+    btn_lib_view = ft.Button(
+        "Biblioteca",
+        icon=ft.Icons.GRID_VIEW,
+        style=ft.ButtonStyle(bgcolor="#2563EB"),
+        on_click=lambda _: switch_view("library"),
+    )
+
+    btn_stats_view = ft.Button(
+        "Estatísticas",
+        icon=ft.Icons.ANALYTICS,
+        style=ft.ButtonStyle(bgcolor="#161B22"),
+        on_click=lambda _: switch_view("stats"),
+    )
+
+    search_field = ft.TextField(
+        hint_text="Buscar jogo na biblioteca...",
+        prefix_icon=ft.Icons.SEARCH,
+        width=240,
+        height=42,
+        text_size=13,
+        on_change=on_search_change,
+    )
+
+    filter_dropdown = ft.Dropdown(
+        width=200,
+        value="all",
+        text_size=13,
+        options=[
+            ft.dropdown.Option("all", "Todos (A-Z)"),
+            ft.dropdown.Option("installed", "Instalados no PC"),
+            ft.dropdown.Option("most_played", "Mais Jogados"),
+            ft.dropdown.Option("played", "Já Jogados"),
+            ft.dropdown.Option("unplayed", "Nunca Jogados"),
+            ft.dropdown.Option("queue", "Backlog: Na Fila"),
+            ft.dropdown.Option("playing", "Backlog: Jogando"),
+            ft.dropdown.Option("completed", "Backlog: Zerados"),
+            ft.dropdown.Option("dropped", "Backlog: Abandonados"),
+        ],
+        on_select=on_filter_change,
+    )
+
     toolbar = ft.Row(
         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         controls=[
             ft.Row(
-                spacing=10,
+                spacing=8,
                 controls=[
-                    ft.TextField(
-                        hint_text="Buscar jogo na biblioteca...",
-                        prefix_icon=ft.Icons.SEARCH,
-                        width=270,
-                        height=42,
-                        text_size=13,
-                        on_change=on_search_change,
-                    ),
-                    ft.Dropdown(
-                        width=210,
-                        value="all",
-                        text_size=13,
-                        options=[
-                            ft.dropdown.Option("all", "Todos (A-Z)"),
-                            ft.dropdown.Option("installed", "Instalados no PC"),
-                            ft.dropdown.Option("most_played", "Mais Jogados"),
-                            ft.dropdown.Option("played", "Já Jogados"),
-                            ft.dropdown.Option("unplayed", "Nunca Jogados"),
-                            ft.dropdown.Option("queue", "Backlog: Na Fila"),
-                            ft.dropdown.Option("playing", "Backlog: Jogando"),
-                            ft.dropdown.Option("completed", "Backlog: Zerados"),
-                            ft.dropdown.Option("dropped", "Backlog: Abandonados"),
-                        ],
-                        on_select=on_filter_change,
-                    ),
+                    btn_lib_view,
+                    btn_stats_view,
+                    search_field,
+                    filter_dropdown,
                     ft.Button(
                         "O que jogar?",
                         icon=ft.Icons.CASINO,
@@ -610,7 +939,7 @@ def main(page: ft.Page):
                 ],
             ),
             ft.Row(
-                spacing=10,
+                spacing=8,
                 controls=[
                     loading_ring,
                     status_text,
@@ -635,6 +964,7 @@ def main(page: ft.Page):
         toolbar,
         ft.Container(height=6),
         games_grid,
+        stats_view,
     )
 
     # Inicialização
