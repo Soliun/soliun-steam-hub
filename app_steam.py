@@ -3,14 +3,35 @@ import requests
 import json
 import os
 import re
+import shutil
 import random
 import threading
 import webbrowser
 from collections import defaultdict
 
-CONFIG_FILE = "config.json"
-CACHE_FILE = "library_cache.json"
-BACKLOG_FILE = "backlog.json"
+APP_VERSION = "v0.4.0"
+
+
+def get_data_dir():
+    """Retorna %APPDATA%\\SoliunSteamHub e migra arquivos locais de testes anteriores se existirem."""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    data_dir = os.path.join(base, "SoliunSteamHub")
+    os.makedirs(data_dir, exist_ok=True)
+
+    for fname in ["config.json", "library_cache.json", "backlog.json"]:
+        target = os.path.join(data_dir, fname)
+        if not os.path.exists(target) and os.path.exists(fname):
+            try:
+                shutil.copy2(fname, target)
+            except Exception:
+                pass
+    return data_dir
+
+
+DATA_DIR = get_data_dir()
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+CACHE_FILE = os.path.join(DATA_DIR, "library_cache.json")
+BACKLOG_FILE = os.path.join(DATA_DIR, "backlog.json")
 
 
 def load_json(path, default):
@@ -30,7 +51,7 @@ def save_json(path, data):
 
 def scan_local_steam_games():
     """Varre as pastas da Steam nos discos locais para identificar jogos instalados, tamanho e unidade."""
-    installed = {}  # {appid: {"size": int, "drive": str}}
+    installed = {}
     candidate_roots = [
         r"C:\Program Files (x86)\Steam",
         r"C:\Program Files\Steam",
@@ -87,11 +108,11 @@ def format_size_gb(size_bytes):
 
 
 def main(page: ft.Page):
-    page.title = "Soliun Steam Hub v0.3.0"
+    page.title = f"Soliun Steam Hub {APP_VERSION}"
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = "#0E1117"
-    page.window.width = 1240
-    page.window.height = 820
+    page.window.width = 1260
+    page.window.height = 830
     page.padding = 20
 
     config = load_json(CONFIG_FILE, {"api_key": "", "steam_id": ""})
@@ -101,7 +122,7 @@ def main(page: ft.Page):
 
     current_filter = "all"
     search_query = ""
-    current_view = "library"  # "library" | "stats"
+    current_view = "library"
 
     # Controles de UI globais
     status_text = ft.Text("", size=13, color="#9BA3B0")
@@ -125,8 +146,8 @@ def main(page: ft.Page):
     games_grid = ft.GridView(
         expand=True,
         runs_count=5,
-        max_extent=245,
-        child_aspect_ratio=0.73,
+        max_extent=250,
+        child_aspect_ratio=0.70,
         spacing=14,
         run_spacing=14,
     )
@@ -138,14 +159,14 @@ def main(page: ft.Page):
         visible=False,
     )
 
-    def show_toast(message):
+    def show_toast(message, icon=ft.Icons.PLAY_CIRCLE_FILLED, icon_color="#4ADE80"):
         snack = ft.SnackBar(
             bgcolor="#1F2937",
             duration=3000,
             content=ft.Row(
                 spacing=10,
                 controls=[
-                    ft.Icon(ft.Icons.PLAY_CIRCLE_FILLED, color="#4ADE80", size=20),
+                    ft.Icon(icon, color=icon_color, size=20),
                     ft.Text(message, color="#F3F4F6", size=13, weight=ft.FontWeight.W_500),
                 ],
             ),
@@ -158,6 +179,14 @@ def main(page: ft.Page):
         webbrowser.open(f"steam://rungameid/{appid}")
         status_text.value = f"Iniciando '{game_name}' via Steam..."
         show_toast(f"Abrindo '{game_name}' na Steam...")
+
+    def open_steam_store(appid, game_name):
+        webbrowser.open(f"steam://store/{appid}")
+        show_toast(f"Abrindo página da loja: {game_name}", ft.Icons.STOREFRONT, "#38BDF8")
+
+    def open_steam_details(appid, game_name):
+        webbrowser.open(f"steam://nav/games/details/{appid}")
+        show_toast(f"Abrindo detalhes na Steam: {game_name}", ft.Icons.OPEN_IN_NEW, "#C084FC")
 
     def format_hours(minutes):
         if minutes == 0:
@@ -195,6 +224,17 @@ def main(page: ft.Page):
         stat_unplayed.value = f"{unplayed_g} ({int((unplayed_g / total_g) * 100) if total_g else 0}%)"
         stat_installed.value = f"{installed_count} ({format_size_gb(installed_bytes)})"
 
+    def rescan_disks_only(e=None):
+        nonlocal installed_map
+        installed_map = scan_local_steam_games()
+        update_stats_and_profile()
+        if current_view == "stats":
+            render_stats()
+            page.update()
+        else:
+            render_games()
+        show_toast(f"Discos verificados: {len(installed_map)} jogos encontrados.", ft.Icons.STORAGE, "#C084FC")
+
     def set_game_status(appid, new_status):
         key = str(appid)
         if new_status == "none":
@@ -209,6 +249,176 @@ def main(page: ft.Page):
             page.update()
         else:
             page.update()
+
+    def open_achievements_dialog(appid, game_name):
+        api_key = config.get("api_key", "").strip()
+        steam_id = config.get("steam_id", "").strip()
+        if not api_key or not steam_id:
+            open_config_dialog()
+            return
+
+        content_box = ft.Column(
+            width=480,
+            height=380,
+            alignment=ft.MainAxisAlignment.CENTER,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.ProgressRing(width=28, height=28),
+                ft.Text("Consultando conquistas na Steam...", size=13, color="#9BA3B0"),
+            ],
+        )
+
+        def close_dlg(_=None):
+            dlg.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(
+                spacing=8,
+                controls=[
+                    ft.Icon(ft.Icons.EMOJI_EVENTS, color="#FACC15"),
+                    ft.Text(f"Conquistas: {game_name}", max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                ],
+            ),
+            content=content_box,
+            actions=[ft.TextButton("Fechar", on_click=close_dlg)],
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+        def fetch_achievements():
+            try:
+                p_url = (
+                    f"https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/"
+                    f"?appid={appid}&key={api_key}&steamid={steam_id}&l=brazilian"
+                )
+                r_player = requests.get(p_url, timeout=12).json()
+                player_stats = r_player.get("playerstats", {})
+
+                if not player_stats.get("success") or not player_stats.get("achievements"):
+                    content_box.controls = [
+                        ft.Icon(ft.Icons.INFO_OUTLINE, color="#9BA3B0", size=34),
+                        ft.Text(
+                            "Este título não possui conquistas registradas ou os dados são privados.",
+                            size=13,
+                            color="#9BA3B0",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    ]
+                    page.update()
+                    return
+
+                s_url = (
+                    f"https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v0002/"
+                    f"?key={api_key}&appid={appid}&l=brazilian"
+                )
+                r_schema = requests.get(s_url, timeout=12).json()
+                schema_list = (
+                    r_schema.get("game", {})
+                    .get("availableGameStats", {})
+                    .get("achievements", [])
+                )
+                schema_map = {item["name"]: item for item in schema_list}
+
+                ach_list = player_stats["achievements"]
+                unlocked = [a for a in ach_list if a.get("achieved") == 1]
+                locked = [a for a in ach_list if a.get("achieved") != 1]
+
+                total_a = len(ach_list)
+                unlocked_count = len(unlocked)
+                pct = (unlocked_count / total_a) if total_a else 0
+
+                rows = []
+                for item in unlocked + locked:
+                    apiname = item.get("apiname", "")
+                    is_done = item.get("achieved") == 1
+                    meta = schema_map.get(apiname, {})
+                    title = meta.get("displayName") or item.get("name") or apiname
+                    desc = meta.get("description") or ("Conquista secreta" if meta.get("hidden") else "")
+                    icon_url = meta.get("icon") if is_done else meta.get("icongray")
+
+                    rows.append(
+                        ft.Container(
+                            bgcolor="#161B22" if is_done else "#11151C",
+                            border=ft.Border.all(1, "#2E4033" if is_done else "#1F242D"),
+                            border_radius=8,
+                            padding=8,
+                            content=ft.Row(
+                                spacing=10,
+                                controls=[
+                                    ft.Image(
+                                        src=icon_url or "",
+                                        width=38,
+                                        height=38,
+                                        border_radius=4,
+                                        error_content=ft.Icon(
+                                            ft.Icons.EMOJI_EVENTS if is_done else ft.Icons.LOCK_OUTLINE,
+                                            color="#FACC15" if is_done else "#6B7280",
+                                            size=24,
+                                        ),
+                                    ),
+                                    ft.Column(
+                                        expand=True,
+                                        spacing=2,
+                                        controls=[
+                                            ft.Text(
+                                                title,
+                                                size=12,
+                                                weight=ft.FontWeight.BOLD,
+                                                color="#F3F4F6" if is_done else "#9CA3AF",
+                                            ),
+                                            ft.Text(
+                                                desc,
+                                                size=11,
+                                                color="#9BA3B0" if is_done else "#6B7280",
+                                                max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                            ),
+                                        ],
+                                    ),
+                                    ft.Icon(
+                                        ft.Icons.CHECK_CIRCLE if is_done else ft.Icons.RADIO_BUTTON_UNCHECKED,
+                                        color="#4ADE80" if is_done else "#4B5563",
+                                        size=18,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
+
+                content_box.alignment = ft.MainAxisAlignment.START
+                content_box.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+                content_box.controls = [
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.Text(
+                                f"Desbloqueadas: {unlocked_count} de {total_a}",
+                                size=13,
+                                weight=ft.FontWeight.BOLD,
+                                color="#FACC15",
+                            ),
+                            ft.Text(
+                                f"{pct * 100:.1f}%",
+                                size=13,
+                                weight=ft.FontWeight.BOLD,
+                                color="#4ADE80",
+                            ),
+                        ],
+                    ),
+                    ft.ProgressBar(value=pct, color="#FACC15", bgcolor="#1F2937", height=8, border_radius=4),
+                    ft.Divider(height=6, color="#262C36"),
+                    ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=6, controls=rows),
+                ]
+            except Exception as ex:
+                content_box.controls = [
+                    ft.Text(f"Erro ao carregar conquistas: {ex}", color="#F87171", size=12)
+                ]
+            page.update()
+
+        threading.Thread(target=fetch_achievements, daemon=True).start()
 
     def render_stats():
         games = cache.get("games", [])
@@ -232,7 +442,6 @@ def main(page: ft.Page):
         top_game_name = top_10[0].get("name", "-") if top_10 else "Nenhum"
         top_game_hours = f"{top_10[0]['playtime_forever'] / 60:.1f}h" if top_10 else "0h"
 
-        # 1. Cards de KPIs Analíticos
         def kpi_box(icon, label, value, sub, color):
             return ft.Container(
                 expand=True,
@@ -250,7 +459,14 @@ def main(page: ft.Page):
                                 ft.Text(label, size=12, color="#9BA3B0"),
                             ],
                         ),
-                        ft.Text(value, size=20, weight=ft.FontWeight.BOLD, color=color, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(
+                            value,
+                            size=20,
+                            weight=ft.FontWeight.BOLD,
+                            color=color,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                        ),
                         ft.Text(sub, size=11, color="#6B7280"),
                     ],
                 ),
@@ -290,7 +506,6 @@ def main(page: ft.Page):
             ],
         )
 
-        # 2. Gráfico de Barras: Top 10 Mais Jogados
         top_bars = []
         for idx, g in enumerate(top_10, start=1):
             mins = g.get("playtime_forever", 0)
@@ -348,7 +563,6 @@ def main(page: ft.Page):
             ),
         )
 
-        # 3. Painel Lateral: Distribuição do Backlog + Uso por Unidade (SSD)
         status_meta = [
             ("completed", "Zerados", "#4ADE80"),
             ("playing", "Jogando", "#FACC15"),
@@ -387,7 +601,6 @@ def main(page: ft.Page):
                 )
             )
 
-        # Armazenamento por Unidade (C:, D:, etc.)
         drive_sizes = defaultdict(int)
         drive_counts = defaultdict(int)
         for g in games:
@@ -524,13 +737,13 @@ def main(page: ft.Page):
 
             cover_control = ft.Container(
                 border_radius=6,
-                tooltip="Clique para abrir/instalar na Steam",
+                tooltip="Clique para jogar ou instalar na Steam",
                 on_click=lambda e, aid=appid, gname=name: launch_steam_game(aid, gname),
                 content=ft.Stack(
                     controls=[
                         ft.Image(
                             src=header_url,
-                            width=225,
+                            width=230,
                             height=105,
                             border_radius=6,
                             fit=ft.BoxFit.COVER,
@@ -583,6 +796,37 @@ def main(page: ft.Page):
                 on_select=lambda e, aid=appid: set_game_status(aid, e.control.value),
             )
 
+            action_buttons = ft.Row(
+                spacing=2,
+                tight=True,
+                controls=[
+                    ft.IconButton(
+                        icon=ft.Icons.EMOJI_EVENTS,
+                        icon_size=16,
+                        icon_color="#FACC15",
+                        tooltip="Ver Conquistas",
+                        padding=4,
+                        on_click=lambda e, aid=appid, gname=name: open_achievements_dialog(aid, gname),
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.STOREFRONT,
+                        icon_size=16,
+                        icon_color="#38BDF8",
+                        tooltip="Abrir na Loja Steam",
+                        padding=4,
+                        on_click=lambda e, aid=appid, gname=name: open_steam_store(aid, gname),
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.OPEN_IN_NEW,
+                        icon_size=16,
+                        icon_color="#9BA3B0",
+                        tooltip="Detalhes na Biblioteca Steam",
+                        padding=4,
+                        on_click=lambda e, aid=appid, gname=name: open_steam_details(aid, gname),
+                    ),
+                ],
+            )
+
             cards.append(
                 ft.Container(
                     bgcolor="#161B22",
@@ -590,7 +834,7 @@ def main(page: ft.Page):
                     border=ft.Border.all(1, "#3B2D54" if is_inst else "#262C36"),
                     padding=10,
                     content=ft.Column(
-                        spacing=8,
+                        spacing=6,
                         controls=[
                             cover_control,
                             ft.Text(
@@ -607,7 +851,7 @@ def main(page: ft.Page):
                                 controls=[
                                     ft.Container(
                                         bgcolor="#1F2937",
-                                        padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+                                        padding=ft.Padding.symmetric(horizontal=7, vertical=3),
                                         border_radius=6,
                                         content=ft.Text(
                                             format_hours(mins),
@@ -616,7 +860,7 @@ def main(page: ft.Page):
                                             weight=ft.FontWeight.BOLD,
                                         ),
                                     ),
-                                    ft.Text(f"ID: {appid}", size=10, color="#6B7280"),
+                                    action_buttons,
                                 ],
                             ),
                         ],
@@ -807,18 +1051,67 @@ def main(page: ft.Page):
 
         dlg = ft.AlertDialog(
             modal=True,
-            title=ft.Text("Configurar Credenciais Steam"),
+            title=ft.Row(
+                spacing=8,
+                controls=[
+                    ft.Icon(ft.Icons.SETTINGS, color="#38BDF8"),
+                    ft.Text(f"Configurar Credenciais ({APP_VERSION})"),
+                ],
+            ),
             content=ft.Column(
                 tight=True,
-                width=420,
+                width=470,
+                spacing=12,
                 controls=[
-                    ft.Text(
-                        "Suas chaves ficam salvas apenas localmente no arquivo config.json.",
-                        size=12,
-                        color="#9BA3B0",
+                    ft.Container(
+                        bgcolor="#161B22",
+                        border=ft.Border.all(1, "#262C36"),
+                        border_radius=8,
+                        padding=12,
+                        content=ft.Column(
+                            spacing=6,
+                            controls=[
+                                ft.Text("Como obter seus dados da Steam:", size=12, weight=ft.FontWeight.BOLD, color="#38BDF8"),
+                                ft.Text(
+                                    "1. Gere sua chave gratuita em steamcommunity.com/dev/apikey (use 'localhost' como domínio).",
+                                    size=11,
+                                    color="#D1D5DB",
+                                ),
+                                ft.Text(
+                                    "2. Copie seu SteamID64 (17 números) nos detalhes da sua conta Steam.",
+                                    size=11,
+                                    color="#D1D5DB",
+                                ),
+                                ft.Text(
+                                    "3. Deixe 'Detalhes dos jogos' como Público na privacidade do perfil.",
+                                    size=11,
+                                    color="#D1D5DB",
+                                ),
+                                ft.Row(
+                                    spacing=8,
+                                    controls=[
+                                        ft.TextButton(
+                                            "Abrir página da API Key",
+                                            icon=ft.Icons.OPEN_IN_NEW,
+                                            on_click=lambda _: webbrowser.open("https://steamcommunity.com/dev/apikey"),
+                                        ),
+                                        ft.TextButton(
+                                            "Ver Detalhes da Conta",
+                                            icon=ft.Icons.PERSON_SEARCH,
+                                            on_click=lambda _: webbrowser.open("https://store.steampowered.com/account/"),
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
                     ),
                     key_field,
                     id_field,
+                    ft.Text(
+                        f"Dados salvos localmente em: {DATA_DIR}",
+                        size=10,
+                        color="#6B7280",
+                    ),
                 ],
             ),
             actions=[
@@ -897,14 +1190,14 @@ def main(page: ft.Page):
     search_field = ft.TextField(
         hint_text="Buscar jogo na biblioteca...",
         prefix_icon=ft.Icons.SEARCH,
-        width=240,
+        width=220,
         height=42,
         text_size=13,
         on_change=on_search_change,
     )
 
     filter_dropdown = ft.Dropdown(
-        width=200,
+        width=195,
         value="all",
         text_size=13,
         options=[
@@ -939,10 +1232,15 @@ def main(page: ft.Page):
                 ],
             ),
             ft.Row(
-                spacing=8,
+                spacing=6,
                 controls=[
                     loading_ring,
                     status_text,
+                    ft.IconButton(
+                        icon=ft.Icons.STORAGE,
+                        tooltip="Reescanear discos locais (SSD/HD)",
+                        on_click=rescan_disks_only,
+                    ),
                     ft.Button(
                         "Sincronizar",
                         icon=ft.Icons.SYNC,
