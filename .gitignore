@@ -5,3 +5,5 @@ __pycache__/
 config.json
 library_cache.json
 backlog.json
+
+installer_output/

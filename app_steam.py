@@ -2,14 +2,17 @@ import flet as ft
 import requests
 import json
 import os
+import sys
 import re
 import shutil
 import random
 import threading
+import asyncio
 import webbrowser
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
-APP_VERSION = "v0.4.0"
+APP_VERSION = "v0.4.1"
 
 
 def get_data_dir():
@@ -18,7 +21,7 @@ def get_data_dir():
     data_dir = os.path.join(base, "SoliunSteamHub")
     os.makedirs(data_dir, exist_ok=True)
 
-    for fname in ["config.json", "library_cache.json", "backlog.json"]:
+    for fname in ["config.json", "library_cache.json", "backlog.json", "achievements_cache.json"]:
         target = os.path.join(data_dir, fname)
         if not os.path.exists(target) and os.path.exists(fname):
             try:
@@ -32,6 +35,7 @@ DATA_DIR = get_data_dir()
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_cache.json")
 BACKLOG_FILE = os.path.join(DATA_DIR, "backlog.json")
+ACH_CACHE_FILE = os.path.join(DATA_DIR, "achievements_cache.json")
 
 
 def load_json(path, default):
@@ -115,9 +119,15 @@ def main(page: ft.Page):
     page.window.height = 830
     page.padding = 20
 
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    icon_path = os.path.join(base_path, "icon.ico")
+    if os.path.exists(icon_path):
+        page.window.icon = icon_path
+
     config = load_json(CONFIG_FILE, {"api_key": "", "steam_id": ""})
     cache = load_json(CACHE_FILE, {"profile": {}, "games": []})
     backlog = load_json(BACKLOG_FILE, {})
+    ach_cache = load_json(ACH_CACHE_FILE, {})
     installed_map = scan_local_steam_games()
 
     current_filter = "all"
@@ -257,20 +267,199 @@ def main(page: ft.Page):
             open_config_dialog()
             return
 
+        cache_key = str(appid)
+        is_closed = False
+
         content_box = ft.Column(
             width=480,
             height=380,
             alignment=ft.MainAxisAlignment.CENTER,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                ft.ProgressRing(width=28, height=28),
-                ft.Text("Consultando conquistas na Steam...", size=13, color="#9BA3B0"),
-            ],
+            controls=[],
         )
 
+        def build_achievements_ui(items_data, from_cache=False):
+            if not items_data:
+                content_box.alignment = ft.MainAxisAlignment.CENTER
+                content_box.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+                content_box.controls = [
+                    ft.Icon(ft.Icons.INFO_OUTLINE, color="#9BA3B0", size=34),
+                    ft.Text(
+                        "Este título não possui conquistas registradas ou os dados são privados.",
+                        size=13,
+                        color="#9BA3B0",
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                ]
+                return
+
+            unlocked = [a for a in items_data if a.get("achieved")]
+            locked = [a for a in items_data if not a.get("achieved")]
+            total_a = len(items_data)
+            unlocked_count = len(unlocked)
+            pct = (unlocked_count / total_a) if total_a else 0
+
+            rows = []
+            for item in unlocked + locked:
+                is_done = item.get("achieved", False)
+                title = item.get("title", "")
+                desc = item.get("desc", "")
+                icon_url = item.get("icon", "")
+
+                rows.append(
+                    ft.Container(
+                        bgcolor="#161B22" if is_done else "#11151C",
+                        border=ft.Border.all(1, "#2E4033" if is_done else "#1F242D"),
+                        border_radius=8,
+                        padding=8,
+                        content=ft.Row(
+                            spacing=10,
+                            controls=[
+                                ft.Image(
+                                    src=icon_url,
+                                    width=38,
+                                    height=38,
+                                    border_radius=4,
+                                    error_content=ft.Icon(
+                                        ft.Icons.EMOJI_EVENTS if is_done else ft.Icons.LOCK_OUTLINE,
+                                        color="#FACC15" if is_done else "#6B7280",
+                                        size=24,
+                                    ),
+                                ),
+                                ft.Column(
+                                    expand=True,
+                                    spacing=2,
+                                    controls=[
+                                        ft.Text(
+                                            title,
+                                            size=12,
+                                            weight=ft.FontWeight.BOLD,
+                                            color="#F3F4F6" if is_done else "#9CA3AF",
+                                        ),
+                                        ft.Text(
+                                            desc,
+                                            size=11,
+                                            color="#9BA3B0" if is_done else "#6B7280",
+                                            max_lines=2,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
+                                    ],
+                                ),
+                                ft.Icon(
+                                    ft.Icons.CHECK_CIRCLE if is_done else ft.Icons.RADIO_BUTTON_UNCHECKED,
+                                    color="#4ADE80" if is_done else "#4B5563",
+                                    size=18,
+                                ),
+                            ],
+                        ),
+                    )
+                )
+
+            source_tag = " (Cache local)" if from_cache else ""
+            content_box.alignment = ft.MainAxisAlignment.START
+            content_box.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+            content_box.controls = [
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    controls=[
+                        ft.Text(
+                            f"Desbloqueadas: {unlocked_count} de {total_a}{source_tag}",
+                            size=13,
+                            weight=ft.FontWeight.BOLD,
+                            color="#FACC15",
+                        ),
+                        ft.Text(
+                            f"{pct * 100:.1f}%",
+                            size=13,
+                            weight=ft.FontWeight.BOLD,
+                            color="#4ADE80",
+                        ),
+                    ],
+                ),
+                ft.ProgressBar(value=pct, color="#FACC15", bgcolor="#1F2937", height=8, border_radius=4),
+                ft.Divider(height=6, color="#262C36"),
+                ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=6, controls=rows),
+            ]
+
+        def _sync_http_fetch():
+            p_url = (
+                f"https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/"
+                f"?appid={appid}&key={api_key}&steamid={steam_id}&l=brazilian"
+            )
+            s_url = (
+                f"https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v0002/"
+                f"?key={api_key}&appid={appid}&l=brazilian"
+            )
+            with requests.Session() as session:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    f_player = executor.submit(session.get, p_url, timeout=8)
+                    f_schema = executor.submit(session.get, s_url, timeout=8)
+                    r_player = f_player.result().json()
+                    r_schema = f_schema.result().json()
+
+            player_stats = r_player.get("playerstats", {})
+            if not player_stats.get("success") or not player_stats.get("achievements"):
+                return []
+
+            schema_list = (
+                r_schema.get("game", {})
+                .get("availableGameStats", {})
+                .get("achievements", [])
+            )
+            schema_map = {item["name"]: item for item in schema_list}
+
+            normalized = []
+            for item in player_stats["achievements"]:
+                apiname = item.get("apiname", "")
+                is_done = item.get("achieved") == 1
+                meta = schema_map.get(apiname, {})
+                normalized.append({
+                    "achieved": is_done,
+                    "title": meta.get("displayName") or item.get("name") or apiname,
+                    "desc": meta.get("description") or ("Conquista secreta" if meta.get("hidden") else ""),
+                    "icon": (meta.get("icon") if is_done else meta.get("icongray")) or "",
+                })
+            return normalized
+
+        async def load_achievements_task(force_refresh=False):
+            if not force_refresh and cache_key in ach_cache:
+                build_achievements_ui(ach_cache[cache_key], from_cache=True)
+                page.update()
+                return
+
+            content_box.alignment = ft.MainAxisAlignment.CENTER
+            content_box.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+            content_box.controls = [
+                ft.ProgressRing(width=28, height=28),
+                ft.Text("Consultando conquistas na Steam...", size=13, color="#9BA3B0"),
+            ]
+            page.update()
+
+            try:
+                normalized = await asyncio.to_thread(_sync_http_fetch)
+                if is_closed:
+                    return
+                ach_cache[cache_key] = normalized
+                save_json(ACH_CACHE_FILE, ach_cache)
+                build_achievements_ui(normalized, from_cache=False)
+            except Exception as ex:
+                if is_closed:
+                    return
+                content_box.alignment = ft.MainAxisAlignment.CENTER
+                content_box.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+                content_box.controls = [
+                    ft.Text(f"Erro ao carregar conquistas: {ex}", color="#F87171", size=12)
+                ]
+            page.update()
+
         def close_dlg(_=None):
+            nonlocal is_closed
+            is_closed = True
             dlg.open = False
             page.update()
+
+        def refresh_clicked(_):
+            page.run_task(load_achievements_task, True)
 
         dlg = ft.AlertDialog(
             modal=True,
@@ -282,143 +471,19 @@ def main(page: ft.Page):
                 ],
             ),
             content=content_box,
-            actions=[ft.TextButton("Fechar", on_click=close_dlg)],
+            actions=[
+                ft.TextButton("Atualizar", icon=ft.Icons.REFRESH, on_click=refresh_clicked),
+                ft.TextButton("Fechar", on_click=close_dlg),
+            ],
         )
         page.overlay.append(dlg)
         dlg.open = True
-        page.update()
 
-        def fetch_achievements():
-            try:
-                p_url = (
-                    f"https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/"
-                    f"?appid={appid}&key={api_key}&steamid={steam_id}&l=brazilian"
-                )
-                r_player = requests.get(p_url, timeout=12).json()
-                player_stats = r_player.get("playerstats", {})
-
-                if not player_stats.get("success") or not player_stats.get("achievements"):
-                    content_box.controls = [
-                        ft.Icon(ft.Icons.INFO_OUTLINE, color="#9BA3B0", size=34),
-                        ft.Text(
-                            "Este título não possui conquistas registradas ou os dados são privados.",
-                            size=13,
-                            color="#9BA3B0",
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                    ]
-                    page.update()
-                    return
-
-                s_url = (
-                    f"https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v0002/"
-                    f"?key={api_key}&appid={appid}&l=brazilian"
-                )
-                r_schema = requests.get(s_url, timeout=12).json()
-                schema_list = (
-                    r_schema.get("game", {})
-                    .get("availableGameStats", {})
-                    .get("achievements", [])
-                )
-                schema_map = {item["name"]: item for item in schema_list}
-
-                ach_list = player_stats["achievements"]
-                unlocked = [a for a in ach_list if a.get("achieved") == 1]
-                locked = [a for a in ach_list if a.get("achieved") != 1]
-
-                total_a = len(ach_list)
-                unlocked_count = len(unlocked)
-                pct = (unlocked_count / total_a) if total_a else 0
-
-                rows = []
-                for item in unlocked + locked:
-                    apiname = item.get("apiname", "")
-                    is_done = item.get("achieved") == 1
-                    meta = schema_map.get(apiname, {})
-                    title = meta.get("displayName") or item.get("name") or apiname
-                    desc = meta.get("description") or ("Conquista secreta" if meta.get("hidden") else "")
-                    icon_url = meta.get("icon") if is_done else meta.get("icongray")
-
-                    rows.append(
-                        ft.Container(
-                            bgcolor="#161B22" if is_done else "#11151C",
-                            border=ft.Border.all(1, "#2E4033" if is_done else "#1F242D"),
-                            border_radius=8,
-                            padding=8,
-                            content=ft.Row(
-                                spacing=10,
-                                controls=[
-                                    ft.Image(
-                                        src=icon_url or "",
-                                        width=38,
-                                        height=38,
-                                        border_radius=4,
-                                        error_content=ft.Icon(
-                                            ft.Icons.EMOJI_EVENTS if is_done else ft.Icons.LOCK_OUTLINE,
-                                            color="#FACC15" if is_done else "#6B7280",
-                                            size=24,
-                                        ),
-                                    ),
-                                    ft.Column(
-                                        expand=True,
-                                        spacing=2,
-                                        controls=[
-                                            ft.Text(
-                                                title,
-                                                size=12,
-                                                weight=ft.FontWeight.BOLD,
-                                                color="#F3F4F6" if is_done else "#9CA3AF",
-                                            ),
-                                            ft.Text(
-                                                desc,
-                                                size=11,
-                                                color="#9BA3B0" if is_done else "#6B7280",
-                                                max_lines=2,
-                                                overflow=ft.TextOverflow.ELLIPSIS,
-                                            ),
-                                        ],
-                                    ),
-                                    ft.Icon(
-                                        ft.Icons.CHECK_CIRCLE if is_done else ft.Icons.RADIO_BUTTON_UNCHECKED,
-                                        color="#4ADE80" if is_done else "#4B5563",
-                                        size=18,
-                                    ),
-                                ],
-                            ),
-                        )
-                    )
-
-                content_box.alignment = ft.MainAxisAlignment.START
-                content_box.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
-                content_box.controls = [
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        controls=[
-                            ft.Text(
-                                f"Desbloqueadas: {unlocked_count} de {total_a}",
-                                size=13,
-                                weight=ft.FontWeight.BOLD,
-                                color="#FACC15",
-                            ),
-                            ft.Text(
-                                f"{pct * 100:.1f}%",
-                                size=13,
-                                weight=ft.FontWeight.BOLD,
-                                color="#4ADE80",
-                            ),
-                        ],
-                    ),
-                    ft.ProgressBar(value=pct, color="#FACC15", bgcolor="#1F2937", height=8, border_radius=4),
-                    ft.Divider(height=6, color="#262C36"),
-                    ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=6, controls=rows),
-                ]
-            except Exception as ex:
-                content_box.controls = [
-                    ft.Text(f"Erro ao carregar conquistas: {ex}", color="#F87171", size=12)
-                ]
+        if cache_key in ach_cache:
+            build_achievements_ui(ach_cache[cache_key], from_cache=True)
             page.update()
-
-        threading.Thread(target=fetch_achievements, daemon=True).start()
+        else:
+            page.run_task(load_achievements_task, False)
 
     def render_stats():
         games = cache.get("games", [])
